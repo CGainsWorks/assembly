@@ -1,5 +1,7 @@
 # hotpath
 
+[![ci](https://github.com/CGainsWorks/assembly/actions/workflows/ci.yml/badge.svg)](https://github.com/CGainsWorks/assembly/actions/workflows/ci.yml)
+
 Hand written x86-64 assembly kernels for the passes an ingestion pipeline makes
 over every byte it accepts, with run time CPU dispatch, a plain C ABI and a test
 suite built around not trusting the assembly.
@@ -173,6 +175,11 @@ file. CI regenerates it and fails on any difference.
 scans it, and compares the line count against `wc` and the checksum against a
 pure Python bit at a time implementation. Two implementations of mine agreeing is
 weak evidence. Agreement with `wc` and with a different language is not.
+
+**The same suite runs on a different vendor's silicon.** Development and
+measurement happened on an AMD Zen 3 desktop. CI runs on Intel Xeon, so every
+kernel, every tier and every guard page test is exercised on a microarchitecture
+the author never touched, under both gcc and clang.
 
 **The build is checked for the things that go wrong specifically because there is
 assembly in it.** Hand written `.S` files are the usual reason a shared object
