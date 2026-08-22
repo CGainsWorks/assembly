@@ -1,0 +1,137 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Correctness across both mainstream toolchains. The kernels are .S files in
+  # Intel syntax, which gcc and clang assemble with their own assemblers, so
+  # both need to stay green. Each test binary walks every dispatch tier the
+  # runner supports, which means the portable fallbacks are covered here too.
+  test:
+    name: test (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report what the runner can do
+        run: |
+          ${{ matrix.cc }} --version
+          grep -m1 'model name' /proc/cpuinfo || true
+          grep -o -m1 -E 'avx2|avx512f|sse4_2|bmi2|pclmulqdq' /proc/cpuinfo | sort -u | tr '\n' ' '
+          echo
+
+      - name: Build
+        run: make CC=${{ matrix.cc }} all
+
+      - name: Which tiers are live on this runner
+        run: ./build/hpscan --cpu
+
+      - name: Full check
+        run: make CC=${{ matrix.cc }} check
+
+  # Address and undefined behaviour sanitisers. Hand written assembly is opaque
+  # to both, which is the point: the sanitisers watch the C that surrounds the
+  # kernels and the buffers the tests hand them.
+  sanitizers:
+    name: sanitizers (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test under asan and ubsan
+        run: make CC=${{ matrix.cc }} sanitize
+
+  # The dispatch layer is the part most likely to break silently, because a
+  # mistake there just means a slower but still correct answer. These steps
+  # assert that asking for a tier actually selects it.
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make all
+
+      - name: HOTPATH_BACKEND selects the requested tier
+        run: |
+          set -eu
+          ./build/hpscan --cpu
+          for b in baseline sse42 avx2; do
+            if ./build/hpscan --cpu | grep -q "$b=yes"; then
+              got=$(HOTPATH_BACKEND=$b ./build/hpscan --cpu | awk '/^selected/ {print $3}')
+              if [ "$got" != "$b" ]; then
+                echo "asked for $b, got $got" >&2
+                exit 1
+              fi
+              echo "HOTPATH_BACKEND=$b honoured"
+            else
+              echo "$b is not available on this runner, skipped"
+            fi
+          done
+
+      - name: An unusable or misspelled request is ignored, not fatal
+        run: |
+          set -eu
+          HOTPATH_BACKEND=nonsense ./build/hpscan --cpu > /dev/null
+          HOTPATH_BACKEND= ./build/hpscan --cpu > /dev/null
+          echo "bad values fall back cleanly"
+
+      - name: Every tier produces identical answers
+        run: |
+          set -eu
+          printf 'alpha\nbeta\ngamma\n' > sample.txt
+          head -c 100000 /dev/urandom >> sample.txt
+          first=""
+          for b in baseline sse42 avx2; do
+            if ./build/hpscan --cpu | grep -q "$b=yes"; then
+              out=$(./build/hpscan --backend=$b sample.txt | grep -E 'bytes|lines|crc32c|fingerprint')
+              if [ -z "$first" ]; then
+                first="$out"
+              elif [ "$first" != "$out" ]; then
+                echo "tier $b disagrees with the first tier" >&2
+                exit 1
+              fi
+            fi
+          done
+          echo "all available tiers agree"
+
+  # The benchmark is not a gate on performance, since a shared CI runner cannot
+  # measure that honestly. It runs so that a change which breaks the harness is
+  # caught here rather than the next time somebody wants numbers.
+  bench-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make all
+      - run: ./build/bench --quick
+
+  # The generated table file is checked in so that building needs no Python.
+  # This proves it still matches what the generator produces, and that the
+  # generator's own arithmetic self checks still pass.
+  generated:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - run: make check-generated
+      - name: Regenerating from scratch reproduces the checked in file
+        run: |
+          set -eu
+          cp src/crc32c_tables.c /tmp/before.c
+          python3 tools/gen_crc32c_tables.py --output src/crc32c_tables.c
+          diff -u /tmp/before.c src/crc32c_tables.c
+          echo "generator output is reproducible"

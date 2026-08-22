@@ -1,0 +1,8 @@
+build/
+*.o
+*.a
+*.so
+*.log
+perf.data*
+__pycache__/
+*.pyc
