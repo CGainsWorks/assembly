@@ -61,8 +61,9 @@ make && make check
 checked in copy, runs the three test programs against every dispatch tier the
 machine supports, confirms the shared library did not end up asking for an
 executable stack, reads the expected instructions back out of the compiled
-archive, and finishes with an end to end run against tools that share no code
-with this project.
+archive, checks that the shared library exports the documented interface and
+nothing else, and finishes with an end to end run against tools that share no
+code with this project.
 
 Other targets:
 
@@ -76,19 +77,22 @@ make CC=clang check # the same, through clang
 To point it at a file:
 
 ```bash
-./build/hpscan /var/log/syslog
+./build/hpscan sample.log
 ```
 
 ```
-/var/log/syslog
+sample.log
   bytes       : 19313600
   lines       : 200000
   ascii clean : yes
   crc32c      : 0x56797204
   fingerprint : 567972046c3dc8d7
   backend     : avx2
-  throughput  : 4.94 GB/s over 1 pass(es) of three scans
+  throughput  : 27.05 GB/s over 1 pass(es) of three scans
 ```
+
+That is a nineteen megabyte log checksummed, counted and encoding checked in
+one command. `make demo` builds exactly that file and verifies the answers.
 
 `./build/hpscan --cpu` reports the detected features and which tiers are live.
 

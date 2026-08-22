@@ -1,0 +1,33 @@
+/*
+ * Linker version script for libhotpath.so.
+ *
+ * Without this the shared object exports every non static symbol, which here
+ * means the reference implementations, the raw assembly entry points and the
+ * internal dispatch table accessor. Those are all reachable from the static
+ * library on purpose, because the tests and the benchmark compare tiers against
+ * each other directly, but none of them is an interface anybody outside this
+ * repository should be able to link against.
+ *
+ * Exporting only the documented surface keeps the freedom to rename or delete
+ * everything else, and it keeps the dynamic symbol table small enough that the
+ * loader has less work to do.
+ *
+ * make check-exports compares this list against what the linked object actually
+ * exports, so adding a public function without adding it here fails the build.
+ */
+HOTPATH_0.1 {
+    global:
+        hp_backend;
+        hp_backend_name;
+        hp_backend_supported;
+        hp_best_backend;
+        hp_count_byte;
+        hp_cpu;
+        hp_crc32c;
+        hp_find_byte;
+        hp_hex_encode;
+        hp_is_ascii;
+        hp_set_backend;
+    local:
+        *;
+};

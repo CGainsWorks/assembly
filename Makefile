@@ -17,6 +17,7 @@ CC = gcc
 endif
 
 AR       ?= ar
+NM       ?= nm
 OBJDUMP  ?= objdump
 BUILD    ?= build
 OPT      ?= -O2
@@ -54,7 +55,7 @@ TEST_BIN = $(TEST_SRC:tests/%.c=$(BUILD)/%)
 
 TOOL_BIN = $(BUILD)/hpscan $(BUILD)/bench
 
-.PHONY: all test bench sanitize check check-generated check-noexecstack check-asm demo clean
+.PHONY: all test bench sanitize check check-generated check-noexecstack check-asm check-exports demo clean
 
 all: $(STATIC) $(SHARED) $(TOOL_BIN)
 
@@ -78,9 +79,13 @@ $(STATIC): $(LIB_OBJ)
 	@mkdir -p $(dir $@)
 	$(AR) rcs $@ $(LIB_OBJ)
 
-$(SHARED): $(PIC_OBJ)
+VERSION_SCRIPT = scripts/hotpath.map
+
+$(SHARED): $(PIC_OBJ) $(VERSION_SCRIPT)
 	@mkdir -p $(dir $@)
-	$(CC) -shared -Wl,-z,noexecstack -o $@ $(PIC_OBJ) $(ALL_LDFLAGS)
+	$(CC) -shared -Wl,-z,noexecstack \
+	    -Wl,--version-script=$(VERSION_SCRIPT) \
+	    -o $@ $(PIC_OBJ) $(ALL_LDFLAGS)
 
 $(BUILD)/%: tests/%.c $(STATIC)
 	@mkdir -p $(dir $@)
@@ -138,7 +143,19 @@ check-asm: $(STATIC)
 demo: $(BUILD)/hpscan
 	@sh scripts/demo.sh $(BUILD)/hpscan
 
-check: check-generated test check-noexecstack check-asm demo
+# A public function that nobody added to the version script would still link
+# and still pass every test, and would then be missing for anyone using the
+# shared library. Comparing the two lists is what catches that.
+check-exports: $(SHARED)
+	@$(NM) -D --defined-only $(SHARED) \
+	    | awk '$$2 ~ /^[TDBR]$$/ {print $$3}' | sed 's/@@.*//' | sort -u > $(BUILD)/exports.actual
+	@sed -n '/global:/,/local:/p' $(VERSION_SCRIPT) \
+	    | tr -d ' 	' | grep ';' | grep -v 'global:' | grep -v 'local:' \
+	    | tr -d ';' | sort -u > $(BUILD)/exports.expected
+	@diff -u $(BUILD)/exports.expected $(BUILD)/exports.actual \
+	    && echo "the shared library exports exactly the documented interface"
+
+check: check-generated test check-noexecstack check-asm check-exports demo
 
 clean:
 	rm -rf $(BUILD) $(BUILD)-asan
