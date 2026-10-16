@@ -195,18 +195,12 @@ int main(void)
     int backend;
     int ran = 0;
 
+    hp_test_check_tier_list();
+
     for (backend = 0; backend < HP_BACKEND_COUNT; backend++) {
-        if (!hp_backend_supported((hp_backend_t)backend)) {
-            printf("skipping %s, not supported here\n",
-                   hp_backend_name((hp_backend_t)backend));
+        if (!hp_test_use_tier((hp_backend_t)backend)) {
             continue;
         }
-        if (hp_set_backend((hp_backend_t)backend) != 0) {
-            HP_CHECK(0, "hp_set_backend(%s) failed although it reported support",
-                     hp_backend_name((hp_backend_t)backend));
-            continue;
-        }
-        printf("backend %s\n", hp_backend_name(hp_backend()));
         run_all();
         ran++;
     }

@@ -14,6 +14,15 @@ set -eu
 
 HPSCAN="${1:-build/hpscan}"
 PYTHON="${PYTHON:-python3}"
+# Optional wrapper, for example wine or Intel SDE, set by make demo RUNNER=...
+HPSCAN_RUNNER="${HPSCAN_RUNNER:-}"
+
+# Windows binaries write CRLF line endings, which would end up inside every
+# field parsed below, so carriage returns are dropped on the way in.
+hpscan() {
+    $HPSCAN_RUNNER "$HPSCAN" "$@" | tr -d '\r'
+}
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM
 
@@ -32,7 +41,7 @@ BYTES=$(wc -c < "$LOG" | tr -d ' ')
 echo "sample is $BYTES bytes"
 
 OUT="$WORK/hpscan.out"
-"$HPSCAN" "$LOG" > "$OUT"
+hpscan "$LOG" > "$OUT"
 cat "$OUT"
 
 got_lines=$(awk '/^  lines/ {print $3}' "$OUT")
@@ -57,7 +66,7 @@ fail() {
 echo "cross checking the checksum against a pure Python implementation"
 SMALL="$WORK/small.log"
 head -n 2000 "$LOG" > "$SMALL"
-"$HPSCAN" "$SMALL" > "$WORK/small.out"
+hpscan "$SMALL" > "$WORK/small.out"
 small_crc=$(awk '/^  crc32c/ {print $3}' "$WORK/small.out" | sed 's/^0x//')
 want_crc=$("$PYTHON" tools/crc32c_ref.py "$SMALL")
 [ "$small_crc" = "$want_crc" ] || fail "crc32c $small_crc, Python says $want_crc"
@@ -65,7 +74,7 @@ want_crc=$("$PYTHON" tools/crc32c_ref.py "$SMALL")
 # Forcing the portable tier has to give byte for byte identical answers.
 echo "re-scanning with the baseline tier"
 BASE="$WORK/baseline.out"
-"$HPSCAN" --backend=baseline "$LOG" > "$BASE"
+hpscan --backend=baseline "$LOG" > "$BASE"
 base_crc=$(awk '/^  crc32c/ {print $3}' "$BASE" | sed 's/^0x//')
 base_lines=$(awk '/^  lines/ {print $3}' "$BASE")
 [ "$base_crc" = "$got_crc" ] || fail "baseline crc32c $base_crc differs from $got_crc"

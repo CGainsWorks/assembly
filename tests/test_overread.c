@@ -11,9 +11,11 @@
  *
  * The method is to map two pages, revoke all access to the second, and place
  * the buffer so its last byte is the last byte of the first page. Any read
- * beyond the buffer lands on the guard page and raises SIGSEGV. Every length
- * from zero to a full page is tried, so every possible tail configuration is
- * covered.
+ * beyond the buffer lands on the guard page and faults. Every length from zero
+ * to a full page is tried, so every possible tail configuration is covered.
+ * That includes the AVX-512 tier, whose tails are masked loads: the
+ * architecture promises that masked out bytes never fault, and this is where
+ * that promise is checked.
  *
  * The same is done for the destination of the hex encoder, which proves it
  * writes exactly two bytes per input byte and not one byte more.
@@ -21,68 +23,16 @@
  * Before any of that, the test deliberately reads the guard page and requires
  * a fault. Without that step a mapping that silently failed to take effect
  * would make the whole file pass while proving nothing.
+ *
+ * Two platform layers provide the same four operations. On Linux the guard is
+ * mprotect and recovery is SIGSEGV plus siglongjmp. On Windows the guard is
+ * VirtualProtect with PAGE_NOACCESS, and recovery is a vectored exception
+ * handler that resumes at a context captured just before the kernel was called.
  */
 #include <stdio.h>
 #include <string.h>
 
 #include "testutil.h"
-
-#if !defined(__linux__)
-
-int main(void)
-{
-    printf("test_overread: skipped, needs mmap and mprotect\n");
-    return 0;
-}
-
-#else
-
-#include <setjmp.h>
-#include <signal.h>
-#include <sys/mman.h>
-#include <unistd.h>
-
-static sigjmp_buf g_jmp;
-
-static void segv_handler(int sig)
-{
-    (void)sig;
-    siglongjmp(g_jmp, 1);
-}
-
-static void install_handler(void)
-{
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = segv_handler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_NODEFER;
-    if (sigaction(SIGSEGV, &sa, NULL) != 0 ||
-        sigaction(SIGBUS, &sa, NULL) != 0) {
-        perror("sigaction");
-        exit(1);
-    }
-}
-
-/*
- * Two pages, the second one unreadable. Returns the address of the first, so
- * that base + page_size is the first byte that must never be touched.
- */
-static unsigned char *make_guarded_region(size_t page_size)
-{
-    unsigned char *base = mmap(NULL, page_size * 2, PROT_READ | PROT_WRITE,
-                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (base == MAP_FAILED) {
-        perror("mmap");
-        exit(1);
-    }
-    if (mprotect(base + page_size, page_size, PROT_NONE) != 0) {
-        perror("mprotect");
-        exit(1);
-    }
-    memset(base, 0x5A, page_size);
-    return base;
-}
 
 /* Sinks, so that nothing here can be optimised away as unused. */
 static volatile uint32_t sink_u32;
@@ -101,6 +51,162 @@ static void run_kernel(int which, const unsigned char *buf, size_t len,
     case 4: hp_hex_encode(hex_dst, buf, len);              break;
     default: break;
     }
+}
+
+/* ------------------------------------------------------------- Windows -- */
+#if defined(_WIN32)
+
+#define HP_GUARD_SUPPORTED 1
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
+static CONTEXT g_resume;
+static volatile LONG g_armed;
+static volatile LONG g_faulted;
+
+/*
+ * Only an access violation raised while a guarded call is in flight is
+ * handled. Anything else, or a fault outside a guarded call, is left to the
+ * normal handlers so a genuine crash still looks like one.
+ */
+static LONG CALLBACK guard_handler(PEXCEPTION_POINTERS info)
+{
+    if (g_armed &&
+        info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+        g_armed = 0;
+        g_faulted = 1;
+        *info->ContextRecord = g_resume;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static size_t page_size(void)
+{
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return (size_t)si.dwPageSize;
+}
+
+static void install_handler(void)
+{
+    if (AddVectoredExceptionHandler(1, guard_handler) == NULL) {
+        fprintf(stderr, "AddVectoredExceptionHandler failed\n");
+        exit(1);
+    }
+}
+
+static unsigned char *make_guarded_region(size_t page)
+{
+    DWORD old;
+    unsigned char *base = VirtualAlloc(NULL, page * 2, MEM_RESERVE | MEM_COMMIT,
+                                       PAGE_READWRITE);
+    if (base == NULL) {
+        fprintf(stderr, "VirtualAlloc failed\n");
+        exit(1);
+    }
+    if (!VirtualProtect(base + page, page, PAGE_NOACCESS, &old)) {
+        fprintf(stderr, "VirtualProtect failed\n");
+        exit(1);
+    }
+    memset(base, 0x5A, page);
+    return base;
+}
+
+/*
+ * RtlCaptureContext returns a second time when the handler resumes from the
+ * captured context, and g_faulted, being volatile, is read fresh both times.
+ * Nothing that is live across the capture is modified before the kernel call,
+ * so resuming leaves this frame exactly as it was.
+ */
+static int run_guarded(int which, const unsigned char *buf, size_t len,
+                       char *hex_dst)
+{
+    g_faulted = 0;
+    RtlCaptureContext(&g_resume);
+    if (g_faulted) {
+        return -1;
+    }
+    g_armed = 1;
+    run_kernel(which, buf, len, hex_dst);
+    g_armed = 0;
+    return 0;
+}
+
+static int address_faults(const unsigned char *addr)
+{
+    volatile unsigned char probe;
+
+    g_faulted = 0;
+    RtlCaptureContext(&g_resume);
+    if (g_faulted) {
+        return 1;
+    }
+    g_armed = 1;
+    probe = *(const volatile unsigned char *)addr;
+    (void)probe;
+    g_armed = 0;
+    return 0;
+}
+
+/* --------------------------------------------------------------- Linux -- */
+#elif defined(__linux__)
+
+#define HP_GUARD_SUPPORTED 1
+
+#include <setjmp.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+static sigjmp_buf g_jmp;
+
+static void segv_handler(int sig)
+{
+    (void)sig;
+    siglongjmp(g_jmp, 1);
+}
+
+static size_t page_size(void)
+{
+    return (size_t)sysconf(_SC_PAGESIZE);
+}
+
+static void install_handler(void)
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = segv_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_NODEFER;
+    if (sigaction(SIGSEGV, &sa, NULL) != 0 ||
+        sigaction(SIGBUS, &sa, NULL) != 0) {
+        perror("sigaction");
+        exit(1);
+    }
+}
+
+/*
+ * Two pages, the second one unreadable. Returns the address of the first, so
+ * that base + page is the first byte that must never be touched.
+ */
+static unsigned char *make_guarded_region(size_t page)
+{
+    unsigned char *base = mmap(NULL, page * 2, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) {
+        perror("mmap");
+        exit(1);
+    }
+    if (mprotect(base + page, page, PROT_NONE) != 0) {
+        perror("mprotect");
+        exit(1);
+    }
+    memset(base, 0x5A, page);
+    return base;
 }
 
 /*
@@ -135,6 +241,19 @@ static int address_faults(const unsigned char *addr)
     return 0;
 }
 
+#endif
+
+#if !defined(HP_GUARD_SUPPORTED)
+
+int main(void)
+{
+    (void)run_kernel;
+    printf("test_overread: skipped, no guard page support for this platform\n");
+    return 0;
+}
+
+#else
+
 static const char *kernel_name(int which)
 {
     static const char *names[] = {
@@ -146,20 +265,21 @@ static const char *kernel_name(int which)
 
 int main(void)
 {
-    size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+    size_t page = page_size();
     unsigned char *src_region;
     unsigned char *dst_region;
     int backend;
 
     install_handler();
+    hp_test_check_tier_list();
 
-    src_region = make_guarded_region(page_size);
-    dst_region = make_guarded_region(page_size);
+    src_region = make_guarded_region(page);
+    dst_region = make_guarded_region(page);
 
     /* The guards have to bite, otherwise everything below is theatre. */
     {
-        int src_armed = address_faults(src_region + page_size);
-        int dst_armed = address_faults(dst_region + page_size);
+        int src_armed = address_faults(src_region + page);
+        int dst_armed = address_faults(dst_region + page);
 
         HP_CHECK(src_armed, "the source guard page was readable");
         HP_CHECK(dst_armed, "the destination guard page was readable");
@@ -171,17 +291,13 @@ int main(void)
     for (backend = 0; backend < HP_BACKEND_COUNT; backend++) {
         size_t len;
 
-        if (!hp_backend_supported((hp_backend_t)backend)) {
-            printf("skipping %s, not supported here\n",
-                   hp_backend_name((hp_backend_t)backend));
+        if (!hp_test_use_tier((hp_backend_t)backend)) {
             continue;
         }
-        hp_set_backend((hp_backend_t)backend);
-        printf("backend %s\n", hp_backend_name(hp_backend()));
 
-        for (len = 0; len <= page_size; len++) {
+        for (len = 0; len <= page; len++) {
             /* Buffer ends flush against the guard page. */
-            const unsigned char *buf = src_region + page_size - len;
+            const unsigned char *buf = src_region + page - len;
             int which;
 
             for (which = 0; which < 5; which++) {
@@ -193,10 +309,10 @@ int main(void)
                      * half a page of input fits with its output flush against
                      * the destination guard page.
                      */
-                    if (len > page_size / 2) {
+                    if (len > page / 2) {
                         continue;
                     }
-                    hex_dst = (char *)(dst_region + page_size - 2 * len);
+                    hex_dst = (char *)(dst_region + page - 2 * len);
                 }
 
                 if (run_guarded(which, buf, len, hex_dst) != 0) {
@@ -210,4 +326,4 @@ int main(void)
     return hp_test_report("test_overread");
 }
 
-#endif /* __linux__ */
+#endif /* HP_GUARD_SUPPORTED */
