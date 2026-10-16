@@ -11,24 +11,31 @@ Development and measurement happened on one machine: an AMD Ryzen 7 5700X, Zen 3
 eight cores, running Ubuntu 22.04 under WSL2 on Windows 11. No other hardware was
 available, and several things follow from that.
 
-### No AVX-512 tier
+### The AVX-512 tier is verified under emulation only
 
-Zen 3 has no AVX-512, so an AVX-512 tier could not be executed once, let alone
-tested or measured. GitHub's hosted runners do not guarantee it either, so CI
-could not stand in.
+Zen 3 has no AVX-512, so the `avx512` tier was written without access to an
+AVX-512 machine. It runs, in full, under Intel SDE 10.13.1 in CI: emulated
+Skylake server, Ice Lake server and Sapphire Rapids parts, every test program,
+every length and alignment in the differential sweep, and the guard page test
+with SDE delivering bad accesses as faults. It also runs under the Windows build
+of SDE, against the Windows calling convention.
 
-The dispatch layer is already shaped to take one. `hp_backend_t` is an ordered
-enum, `hp_backend_supported` is the single place that decides what a machine may
-run, and the dispatch table is one row per tier, so adding `HP_BACKEND_AVX512`
-means adding a row and a feature test rather than restructuring anything.
+GitHub's hosted runners are a mix of parts, and some have AVX-512: one run on
+2026-10-16 landed its dispatch job on an AMD EPYC 9V45, where `avx512` was offered,
+selected on request and agreed with the other tiers on a sample file. The native
+test jobs run every tier the runner offers, so on such a runner they cover
+`avx512` too. That is luck of the draw rather than a guarantee, which is why SDE
+is the check that is relied on.
 
-What it would take: a Zen 4, Zen 5 or Ice Lake or later Xeon machine. The
-kernels worth writing first are `hp_count_byte` and `hp_is_ascii` on 512 bit
-registers with `k` mask registers replacing the scalar tails, and a `vpermb`
-based hex encoder, which is the one case where AVX-512 VBMI does something
-128 bit SSSE3 genuinely cannot. Note that on several Intel parts sustained
-512 bit work lowers the clock, so the tier would need measuring before being
-enabled by default rather than being assumed faster.
+SDE proves the instructions are used correctly. It says nothing about speed, so
+the tier has never been timed, and on several Intel parts sustained 512 bit work
+lowers the clock. For that reason `hp_best_backend()` does not choose it; it is
+reached through `HOTPATH_BACKEND=avx512` or `hp_set_backend`.
+
+What it would take: an Ice Lake or later Xeon, or a Zen 4 or Zen 5 machine, to
+time it against `avx2` and decide whether it should become the default. The
+obvious next kernel is a `vpermb` based hex encoder, which needs AVX-512 VBMI and
+is the one case where AVX-512 does something 128 bit SSSE3 genuinely cannot.
 
 ### No ARM or NEON port
 
@@ -43,33 +50,37 @@ the ARMv8 CRC32 extension almost directly, and the three way pipelining and the
 Galois field stitching in `src/asm/crc32c.S` carry over unchanged, since that
 argument is about the polynomial and not about the instruction set.
 
-### No Windows or MSVC support
+### Windows means MinGW-w64, static library only
 
-Only the System V AMD64 ABI is implemented. The Microsoft x64 ABI passes
-arguments in different registers and, more awkwardly for these kernels, makes
-`xmm6` through `xmm15` callee saved. No MSVC or MinGW toolchain was installed on
-the development machine, so a second ABI could have been written but not built or
-run, and untested assembly is worse than absent assembly.
+The Microsoft x64 calling convention is supported through the shim in
+`src/asm/hp_asm.h` and tested on GitHub's `windows-2025` runners with MinGW-w64
+gcc and with clang from MSYS2. `tests/test_abi.c` checks that `rdi`, `rsi` and
+`xmm6` to `xmm15` survive every kernel. The Windows runners seen so far report an
+AMD EPYC 7763, so `baseline`, `sse42` and `avx2` run natively there and `avx512`
+under the Windows build of Intel SDE.
 
-What it would take: MSVC or a MinGW cross toolchain, plus a Windows CI job. The
-kernels themselves stay within `xmm0` to `xmm5` and `ymm0` to `ymm4`, so the
-register save requirement happens to be satisfied already. The work is the
-argument register mapping and a build path, not the kernels.
+Two things are not done. There is no DLL, only a static library, because the
+export list is a GNU linker version script and an equivalent `.def` file has not
+been written. And there is no MSVC build: `ml64` does not read GNU assembler
+syntax, and a second copy of every kernel in MASM would double the code that has
+to be trusted. No Windows machine was used for development; all Windows execution
+is on CI runners, plus wine in a container while writing the shim.
 
 ### Benchmark numbers come from a contended desktop
 
-The machine that produced [docs/BENCHMARKS.md](docs/BENCHMARKS.md) was running a
-browser and other work at the time, at a load average above two. There was no
-access to a quiet machine with boost disabled, cores isolated and the governor
-pinned, which is what performance numbers of this kind normally deserve.
+The machine that produced [docs/BENCHMARKS.md](docs/BENCHMARKS.md) is a desktop
+that was running other interactive work and build jobs at the time;
+the load average before and after the run is recorded at the top of that file.
+There was no access to a quiet machine with boost disabled, cores isolated and
+the governor pinned, which is what performance numbers of this kind normally
+deserve.
 
-Three things were done about it rather than ignoring it. Tiers are timed in
+Three things were done about it rather than ignoring it. Columns are timed in
 rotation rather than one after another, so drift over the run is shared between
 columns instead of landing on one. The fastest run of several is kept rather than
 the mean, since contention only ever makes a run slower. And two kernels are
 shared between the `sse42` and `avx2` tiers, so those two columns run identical
-code and the gap between them is a direct read on the noise floor, currently a
-few percent.
+code and the gap between them is a direct read on the noise floor.
 
 Treat the tables as a sound ranking with roughly correct magnitudes, not as
 precise figures.
@@ -94,6 +105,14 @@ them against one contended desktop would produce numbers that mean nothing
 anywhere else, so neither was attempted.
 
 ## Constrained by scope
+
+### Some baselines are missing because nothing fair exists
+
+`hp_count_byte` and `hp_hex_encode` are compared only with compiled C, at `-O2`
+and at `-O3 -march=native`, because no widely used library exports a plain byte
+count or a bare hex encoder with the same contract. Faster published techniques
+exist for both, inside larger projects, and a comparison with those would need
+extracting them first.
 
 ### The dispatch layer is not thread safe to reconfigure
 
