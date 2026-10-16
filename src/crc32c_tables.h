@@ -3,14 +3,16 @@
  *
  * The tables are hidden from the dynamic symbol table so that the assembly
  * kernel can reach them with a plain rip relative lea instead of an indirect
- * load through the global offset table.
+ * load through the global offset table. PE/COFF on Windows has no symbol
+ * preemption and no visibility attribute, and needs neither for the same
+ * effect.
  */
 #ifndef HOTPATH_CRC32C_TABLES_H
 #define HOTPATH_CRC32C_TABLES_H
 
 #include <stdint.h>
 
-#if defined(__GNUC__)
+#if defined(__GNUC__) && !defined(_WIN32)
 #define HP_HIDDEN __attribute__((visibility("hidden")))
 #else
 #define HP_HIDDEN

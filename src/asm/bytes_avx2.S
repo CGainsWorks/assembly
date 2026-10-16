@@ -8,11 +8,15 @@
  * kernel ever touches a byte outside the caller's buffer. tests/test_overread.c
  * holds that promise to a guard page.
  *
- * System V AMD64 ABI. Arguments in rdi, rsi, edx. Result in rax or eax. Only
- * caller saved registers are used, so there is no prologue or epilogue. Every
+ * Written against the System V AMD64 ABI: arguments in rdi, rsi, edx, result
+ * in rax or eax. src/asm/hp_asm.h adapts entry and exit for Windows. Only
+ * registers that are caller saved under both conventions are used, ymm0 to
+ * ymm4 included, so the body needs no prologue or epilogue of its own. Every
  * exit path runs vzeroupper first to avoid the SSE to AVX transition penalty
  * in whatever the caller does next.
  */
+#include "hp_asm.h"
+
     .intel_syntax noprefix
     .text
 
@@ -24,10 +28,7 @@
 /* per lane, so it has to be drained before any lane can reach 256. Draining */
 /* with vpsadbw folds each half into a 64 bit lane sum for free.             */
 /* ------------------------------------------------------------------------ */
-    .globl  hp_count_byte_avx2
-    .type   hp_count_byte_avx2, @function
-    .p2align 4
-hp_count_byte_avx2:
+    HP_FUNC hp_count_byte_avx2
     movzx   eax, dl
     vmovd   xmm0, eax
     vpbroadcastb ymm0, xmm0         /* needle in every lane                 */
@@ -109,8 +110,8 @@ hp_count_byte_avx2:
 
 .Lcb_done:
     vzeroupper
-    ret
-    .size   hp_count_byte_avx2, .-hp_count_byte_avx2
+    HP_RET
+    HP_ENDFUNC hp_count_byte_avx2
 
 /* ------------------------------------------------------------------------ */
 /* const void *hp_find_byte_avx2(const void *buf, size_t len, uint8_t x)     */
@@ -119,10 +120,7 @@ hp_count_byte_avx2:
 /* byte window is tested with a single branch. bsf rather than tzcnt keeps   */
 /* this kernel free of any BMI1 requirement.                                 */
 /* ------------------------------------------------------------------------ */
-    .globl  hp_find_byte_avx2
-    .type   hp_find_byte_avx2, @function
-    .p2align 4
-hp_find_byte_avx2:
+    HP_FUNC hp_find_byte_avx2
     movzx   eax, dl
     vmovd   xmm0, eax
     vpbroadcastb ymm0, xmm0
@@ -147,7 +145,7 @@ hp_find_byte_avx2:
     add     rdi, rax
     mov     rax, rdi
     vzeroupper
-    ret
+    HP_RET
 
 .Lfb_tail:
     test    rcx, rcx
@@ -162,13 +160,13 @@ hp_find_byte_avx2:
 .Lfb_miss:
     xor     eax, eax
     vzeroupper
-    ret
+    HP_RET
 
 .Lfb_tail_hit:
     mov     rax, rdi
     vzeroupper
-    ret
-    .size   hp_find_byte_avx2, .-hp_find_byte_avx2
+    HP_RET
+    HP_ENDFUNC hp_find_byte_avx2
 
 /* ------------------------------------------------------------------------ */
 /* int hp_is_ascii_avx2(const void *buf, size_t len)                         */
@@ -177,10 +175,7 @@ hp_find_byte_avx2:
 /* into one register with vpor and inspected once at the end. That keeps the */
 /* loop free of branches on data.                                            */
 /* ------------------------------------------------------------------------ */
-    .globl  hp_is_ascii_avx2
-    .type   hp_is_ascii_avx2, @function
-    .p2align 4
-hp_is_ascii_avx2:
+    HP_FUNC hp_is_ascii_avx2
     vpxor   ymm2, ymm2, ymm2        /* running bitwise or of every byte     */
     mov     rcx, rsi
     cmp     rcx, 128
@@ -230,12 +225,12 @@ hp_is_ascii_avx2:
 .Lia_true:
     mov     eax, 1
     vzeroupper
-    ret
+    HP_RET
 
 .Lia_false:
     xor     eax, eax
     vzeroupper
-    ret
-    .size   hp_is_ascii_avx2, .-hp_is_ascii_avx2
+    HP_RET
+    HP_ENDFUNC hp_is_ascii_avx2
 
-    .section .note.GNU-stack,"",@progbits
+    HP_NOTE_GNU_STACK

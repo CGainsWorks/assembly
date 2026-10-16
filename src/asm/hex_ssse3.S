@@ -12,12 +12,16 @@
  * the buffer sizes this library cares about the extra shuffle cancels most of
  * the gain, so the same 128 bit kernel serves both. See docs/DESIGN.md.
  *
- * System V AMD64 ABI. Arguments in rdi, rsi, rdx. No return value. Legacy SSE
+ * Written against the System V AMD64 ABI: arguments in rdi, rsi, rdx, no
+ * return value. src/asm/hp_asm.h adapts entry and exit for Windows. Only xmm0
+ * to xmm5 are used, which are volatile under both conventions. Legacy SSE
  * encodings throughout, so no vzeroupper is needed.
  */
+#include "hp_asm.h"
+
     .intel_syntax noprefix
 
-    .section .rodata
+    HP_RODATA_SECTION
     .p2align 4
 .Lhex_digits:
     .ascii  "0123456789abcdef"
@@ -27,10 +31,7 @@
     .text
 
 /* void hp_hex_encode_ssse3(char *dst, const void *src, size_t len) */
-    .globl  hp_hex_encode_ssse3
-    .type   hp_hex_encode_ssse3, @function
-    .p2align 4
-hp_hex_encode_ssse3:
+    HP_FUNC hp_hex_encode_ssse3
     test    rdx, rdx
     jz      .Lhx_done
     lea     r8, [rip + .Lhex_digits]
@@ -77,7 +78,7 @@ hp_hex_encode_ssse3:
     jnz     .Lhx_tail
 
 .Lhx_done:
-    ret
-    .size   hp_hex_encode_ssse3, .-hp_hex_encode_ssse3
+    HP_RET
+    HP_ENDFUNC hp_hex_encode_ssse3
 
-    .section .note.GNU-stack,"",@progbits
+    HP_NOTE_GNU_STACK

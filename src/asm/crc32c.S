@@ -20,9 +20,13 @@
  * large buffer, the short one keeps mid sized buffers on the fast path, and
  * whatever is left falls through to a single stream tail.
  *
- * System V AMD64 ABI. Arguments in edi, rsi, rdx. Result in eax. Only caller
- * saved registers are touched, so there is no prologue or epilogue.
+ * Written against the System V AMD64 ABI: arguments in edi, rsi, rdx, result
+ * in eax. src/asm/hp_asm.h adapts entry and exit for Windows, where rdi is
+ * callee saved; the shim saves it, so the body's use of rdi as a table
+ * pointer is safe under both conventions.
  */
+#include "hp_asm.h"
+
     .intel_syntax noprefix
 
 /* Must match SHORT_BLOCK and LONG_BLOCK in tools/gen_crc32c_tables.py. */
@@ -54,10 +58,7 @@
     .endm
 
 /* uint32_t hp_crc32c_sse42(uint32_t crc, const void *buf, size_t len) */
-    .globl  hp_crc32c_sse42
-    .type   hp_crc32c_sse42, @function
-    .p2align 4
-hp_crc32c_sse42:
+    HP_FUNC hp_crc32c_sse42
     mov     eax, edi                /* running raw CRC register            */
     not     eax                     /* zlib convention: invert on the way in */
 
@@ -129,7 +130,7 @@ hp_crc32c_sse42:
 
 .Lcrc_done:
     not     eax
-    ret
-    .size   hp_crc32c_sse42, .-hp_crc32c_sse42
+    HP_RET
+    HP_ENDFUNC hp_crc32c_sse42
 
-    .section .note.GNU-stack,"",@progbits
+    HP_NOTE_GNU_STACK
