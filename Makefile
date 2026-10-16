@@ -35,8 +35,9 @@ PYTHON   ?= python3
 RUNNER   ?=
 
 # Read the target from the compiler rather than the host, so cross builds work.
+# MinGW-w64 gcc reports x86_64-w64-mingw32, clang x86_64-w64-windows-gnu.
 TARGET_TRIPLE := $(shell $(CC) -dumpmachine)
-ifneq (,$(findstring mingw,$(TARGET_TRIPLE)))
+ifneq (,$(findstring mingw,$(TARGET_TRIPLE))$(findstring windows,$(TARGET_TRIPLE)))
 WINDOWS  := 1
 EXE      := .exe
 else
