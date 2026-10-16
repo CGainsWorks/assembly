@@ -12,7 +12,7 @@
  *   hpscan [options] [file ...]      reads standard input when given no file
  *
  * Options:
- *   --backend=NAME   force baseline, sse42 or avx2
+ *   --backend=NAME   force baseline, sse42, avx2 or avx512
  *   --repeat=N       process each input N times for a steadier throughput figure
  *   --cpu            print the detected CPU features and exit
  *   --help
@@ -20,18 +20,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 #include "hotpath.h"
+#include "timing.h"
 
 #define CHUNK (1u << 20)
-
-static double now_seconds(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-}
 
 static void print_cpu(void)
 {
@@ -41,7 +34,10 @@ static void print_cpu(void)
     printf("features     : sse2=%d ssse3=%d sse42=%d pclmul=%d avx=%d avx2=%d bmi2=%d\n",
            cpu->sse2, cpu->ssse3, cpu->sse42, cpu->pclmul, cpu->avx,
            cpu->avx2, cpu->bmi2);
+    printf("avx-512      : f=%d bw=%d popcnt=%d\n", cpu->avx512f, cpu->avx512bw,
+           cpu->popcnt);
     printf("os ymm state : %d\n", cpu->ymm_enabled);
+    printf("os zmm state : %d\n", cpu->zmm_enabled);
     printf("tiers        : ");
     {
         int i;
@@ -115,13 +111,13 @@ static int scan_stream(const char *name, FILE *fp, long repeat)
         return 1;
     }
 
-    start = now_seconds();
+    start = hp_now_seconds();
     for (r = 0; r < repeat; r++) {
         crc = hp_crc32c(0, buf, len);
         lines = hp_count_byte(buf, len, '\n');
         ascii = hp_is_ascii(buf, len);
     }
-    elapsed = now_seconds() - start;
+    elapsed = hp_now_seconds() - start;
 
     /* Eight bytes of the CRC seeded digest, as a short human readable tag. */
     {
@@ -156,7 +152,7 @@ static int scan_stream(const char *name, FILE *fp, long repeat)
 
 static void usage(const char *argv0)
 {
-    printf("usage: %s [--backend=baseline|sse42|avx2] [--repeat=N] [--cpu] [file ...]\n",
+    printf("usage: %s [--backend=baseline|sse42|avx2|avx512] [--repeat=N] [--cpu] [file ...]\n",
            argv0);
 }
 

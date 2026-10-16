@@ -34,6 +34,9 @@ size_t      hp_count_byte_avx2(const void *buf, size_t len, uint8_t needle);
 const void *hp_find_byte_avx2(const void *buf, size_t len, uint8_t needle);
 int         hp_is_ascii_avx2(const void *buf, size_t len);
 void        hp_hex_encode_ssse3(char *dst, const void *src, size_t len);
+size_t      hp_count_byte_avx512(const void *buf, size_t len, uint8_t needle);
+const void *hp_find_byte_avx512(const void *buf, size_t len, uint8_t needle);
+int         hp_is_ascii_avx512(const void *buf, size_t len);
 
 /* One row of the dispatch table, one row per tier. */
 typedef struct {

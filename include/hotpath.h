@@ -18,21 +18,27 @@ extern "C" {
 #endif
 
 #define HOTPATH_VERSION_MAJOR 0
-#define HOTPATH_VERSION_MINOR 1
+#define HOTPATH_VERSION_MINOR 2
 #define HOTPATH_VERSION_PATCH 0
-#define HOTPATH_VERSION_STRING "0.1.0"
+#define HOTPATH_VERSION_STRING "0.2.0"
 
 /*
  * Dispatch tiers, ordered by capability. A tier is selectable only if the host
  * CPU reports every feature the tier needs.
+ *
+ * HP_BACKEND_AVX512 is never chosen automatically. It has been verified for
+ * correctness under Intel SDE but has not been timed on real AVX-512 hardware,
+ * and on several Intel parts sustained 512 bit work lowers the clock, so it is
+ * opt in through HOTPATH_BACKEND=avx512 or hp_set_backend().
  */
 typedef enum {
     HP_BACKEND_BASELINE = 0, /* portable C, no SIMD, runs on any x86-64 */
     HP_BACKEND_SSE42    = 1, /* SSE4.2 CRC32 plus SSSE3 shuffles           */
-    HP_BACKEND_AVX2     = 2  /* 256-bit integer SIMD                       */
+    HP_BACKEND_AVX2     = 2, /* 256-bit integer SIMD                       */
+    HP_BACKEND_AVX512   = 3  /* AVX-512 BW with masked tails, opt in       */
 } hp_backend_t;
 
-#define HP_BACKEND_COUNT 3
+#define HP_BACKEND_COUNT 4
 
 /* Decoded CPUID feature bits, filled once on first use. */
 typedef struct {
@@ -46,6 +52,11 @@ typedef struct {
     int osxsave;
     int ymm_enabled; /* XCR0 says the OS saves and restores YMM state */
     char brand[49];  /* NUL terminated CPU brand string, may be empty  */
+    /* Added in 0.2.0, after the fields above so their offsets are unchanged. */
+    int popcnt;
+    int avx512f;
+    int avx512bw;
+    int zmm_enabled; /* XCR0 says the OS saves opmask and all ZMM state */
 } hp_cpu_info;
 
 /* Feature detection and dispatch control. */

@@ -8,9 +8,10 @@
  * problem onto whoever deploys the software.
  *
  * The environment variable HOTPATH_BACKEND overrides the choice at start up
- * with one of "baseline", "sse42" or "avx2". CI uses it to run the whole test
- * suite against every tier the runner can execute, so the scalar paths are
- * covered even on a host that has AVX2.
+ * with one of "baseline", "sse42", "avx2" or "avx512". CI uses it to run the
+ * whole test suite against every tier the runner can execute, so the scalar
+ * paths are covered even on a host that has AVX2, and under Intel SDE to reach
+ * the AVX-512 tier that no hosted runner can be relied on to have.
  */
 #include <stdlib.h>
 #include <string.h>
@@ -42,6 +43,7 @@ static void detect_cpu(hp_cpu_info *info)
         info->pclmul  = (regs[2] >>  1) & 1;   /* ecx bit 1  */
         info->ssse3   = (regs[2] >>  9) & 1;   /* ecx bit 9  */
         info->sse42   = (regs[2] >> 20) & 1;   /* ecx bit 20 */
+        info->popcnt  = (regs[2] >> 23) & 1;   /* ecx bit 23 */
         info->osxsave = (regs[2] >> 27) & 1;   /* ecx bit 27 */
         info->avx     = (regs[2] >> 28) & 1;   /* ecx bit 28 */
     }
@@ -50,6 +52,8 @@ static void detect_cpu(hp_cpu_info *info)
         hp_asm_cpuid(7, 0, regs);
         info->avx2 = (regs[1] >> 5) & 1;       /* ebx bit 5 */
         info->bmi2 = (regs[1] >> 8) & 1;       /* ebx bit 8 */
+        info->avx512f  = (regs[1] >> 16) & 1;  /* ebx bit 16 */
+        info->avx512bw = (regs[1] >> 30) & 1;  /* ebx bit 30 */
     }
 
     /*
@@ -62,6 +66,14 @@ static void detect_cpu(hp_cpu_info *info)
     if (info->osxsave) {
         uint64_t xcr0 = hp_asm_xgetbv0();
         info->ymm_enabled = ((xcr0 & 0x6) == 0x6);  /* XMM and YMM state */
+        /*
+         * AVX-512 needs three more state components on top of those: the
+         * opmask registers (bit 5), the upper halves of zmm0 to zmm15 (bit 6)
+         * and zmm16 to zmm31 entirely (bit 7). An OS that enables AVX but not
+         * these, or a hypervisor that hides them, leaves the tier unusable
+         * however the CPUID bits read.
+         */
+        info->zmm_enabled = ((xcr0 & 0xE6) == 0xE6);
     }
 
     hp_asm_cpuid(0x80000000U, 0, regs);
@@ -109,6 +121,19 @@ static const hp_impl_table g_tables[HP_BACKEND_COUNT] = {
         hp_find_byte_avx2,
         hp_is_ascii_avx2,
         hp_hex_encode_ssse3
+    },
+    /*
+     * HP_BACKEND_AVX512: the byte kernels on 512 bit registers with masked
+     * tails. The CRC is bound by the crc32 instruction rather than by vector
+     * width, and the hex encoder is shared for the reason given in
+     * docs/DESIGN.md, so both stay as they are.
+     */
+    {
+        hp_crc32c_sse42,
+        hp_count_byte_avx512,
+        hp_find_byte_avx512,
+        hp_is_ascii_avx512,
+        hp_hex_encode_ssse3
     }
 };
 
@@ -131,11 +156,19 @@ int hp_backend_supported(hp_backend_t backend)
         return cpu->sse42 && cpu->ssse3;
     case HP_BACKEND_AVX2:
         return cpu->sse42 && cpu->ssse3 && cpu->avx2 && cpu->ymm_enabled;
+    case HP_BACKEND_AVX512:
+        return cpu->sse42 && cpu->ssse3 && cpu->avx2 && cpu->ymm_enabled &&
+               cpu->avx512f && cpu->avx512bw && cpu->bmi2 && cpu->popcnt &&
+               cpu->zmm_enabled;
     default:
         return 0;
     }
 }
 
+/*
+ * The best tier that is selected without being asked for. AVX-512 is left out
+ * on purpose: see the note on HP_BACKEND_AVX512 in include/hotpath.h.
+ */
 hp_backend_t hp_best_backend(void)
 {
     if (hp_backend_supported(HP_BACKEND_AVX2)) {
@@ -153,6 +186,7 @@ const char *hp_backend_name(hp_backend_t backend)
     case HP_BACKEND_BASELINE: return "baseline";
     case HP_BACKEND_SSE42:    return "sse42";
     case HP_BACKEND_AVX2:     return "avx2";
+    case HP_BACKEND_AVX512:   return "avx512";
     default:                  return "unknown";
     }
 }
