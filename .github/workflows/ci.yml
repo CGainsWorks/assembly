@@ -1,34 +1,71 @@
 name: ci
 
+# Documentation only changes do not need a build.
 on:
   push:
     branches: [main]
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'tests/**'
+      - 'bench/**'
+      - 'tools/**'
+      - 'scripts/**'
+      - 'Makefile'
+      - '.github/workflows/**'
   pull_request:
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'tests/**'
+      - 'bench/**'
+      - 'tools/**'
+      - 'scripts/**'
+      - 'Makefile'
+      - '.github/workflows/**'
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# A newer push to the same branch makes the older run pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Intel Software Development Emulator, pinned by version and checksum. It is
+  # what puts the AVX-512 tier, and the pre AVX2 tiers, on a real decoder in CI.
+  SDE_VERSION: 10.13.1-2026-07-28
+  SDE_LINUX_URL: https://downloadmirror.intel.com/924984/sde-external-10.13.1-2026-07-28-lin.tar.xz
+  SDE_LINUX_SHA256: 94e97d623fec54385686e1e7ba65ebc9941748c05ee451423948334892bf2b50
+  SDE_WINDOWS_URL: https://downloadmirror.intel.com/924984/sde-external-10.13.1-2026-07-28-win.tar.xz
+  SDE_WINDOWS_SHA256: 74e626ede09b0baa5011fc9e51b58627ea92c3fc0bae5fd7db34b490f335f651
+
 jobs:
   # Correctness across both mainstream toolchains. The kernels are .S files in
-  # Intel syntax, which gcc and clang assemble with their own assemblers, so
-  # both need to stay green. Each test binary walks every dispatch tier the
-  # runner supports, which means the portable fallbacks are covered here too.
+  # Intel syntax: gcc hands them to GNU as, clang to its integrated assembler,
+  # so both need to stay green. The runner image and the compiler versions are
+  # pinned, which pins the assembler (binutils 2.42 on ubuntu-24.04). Each test
+  # binary walks every dispatch tier the runner supports, and test-tiers then
+  # runs the suite once per tier on its own.
   test:
     name: test (${{ matrix.cc }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        cc: [gcc, clang]
+        cc: [gcc-13, clang-18]
     steps:
       - uses: actions/checkout@v7
 
-      - name: Report what the runner can do
+      - name: Report the toolchain and what the runner can do
         run: |
-          ${{ matrix.cc }} --version
+          ${{ matrix.cc }} --version | head -1
+          as --version | head -1
           grep -m1 'model name' /proc/cpuinfo || true
-          grep -o -m1 -E 'avx2|avx512f|sse4_2|bmi2|pclmulqdq' /proc/cpuinfo | sort -u | tr '\n' ' '
+          grep -o -E 'avx2|avx512f|avx512bw|sse4_2|bmi2|pclmulqdq' /proc/cpuinfo | sort -u | tr '\n' ' '
           echo
 
       - name: Build
@@ -40,35 +77,209 @@ jobs:
       - name: Full check
         run: make CC=${{ matrix.cc }} check
 
+      - name: Every supported tier on its own
+        run: make CC=${{ matrix.cc }} test-tiers
+
   # Address and undefined behaviour sanitisers. Hand written assembly is opaque
   # to both, which is the point: the sanitisers watch the C that surrounds the
   # kernels and the buffers the tests hand them.
   sanitizers:
     name: sanitizers (${{ matrix.cc }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        cc: [gcc, clang]
+        cc: [gcc-13, clang-18]
     steps:
       - uses: actions/checkout@v7
       - name: Build and test under asan and ubsan
         run: make CC=${{ matrix.cc }} sanitize
 
+  # Every dispatch tier, executed on an emulated CPU that has exactly the
+  # features of a named Intel part. SDE runs in chip check mode, so an
+  # instruction the emulated part lacks stops the run rather than executing,
+  # which proves each tier stays inside its own instruction set as well as
+  # computing the right answers. The table is the contract:
+  #
+  #   model  emulated part         tiers the library must offer   chosen
+  #   mrm    Merom (2006)          baseline                       baseline
+  #   nhm    Nehalem               baseline sse42                 sse42
+  #   hsw    Haswell               + avx2                         avx2
+  #   srf    Sierra Forest         + avx2, no AVX-512             avx2
+  #   skx    Skylake server        + avx512                       avx2
+  #   icx    Ice Lake server       + avx512                       avx2
+  #   spr    Sapphire Rapids       + avx512                       avx2
+  #
+  # avx2 stays the automatic choice on AVX-512 parts by design; avx512 is opt
+  # in until it has been timed on real hardware. -ptr-raise makes SDE deliver
+  # a bad access to the program as a fault, which test_overread relies on.
+  sde:
+    name: sde (every tier, emulated)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache Intel SDE
+        id: sde-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/sde
+          key: sde-linux-${{ env.SDE_VERSION }}
+
+      - name: Fetch Intel SDE
+        if: steps.sde-cache.outputs.cache-hit != 'true'
+        run: |
+          set -eu
+          curl -sSfL --retry 3 -o /tmp/sde.tar.xz "$SDE_LINUX_URL"
+          echo "$SDE_LINUX_SHA256  /tmp/sde.tar.xz" | sha256sum -c -
+          mkdir -p ~/sde
+          tar -xJf /tmp/sde.tar.xz -C ~/sde --strip-components=1
+
+      - name: Build
+        run: |
+          ~/sde/sde64 -version | head -3
+          make CC=gcc-13 all build/test_vectors build/test_differential build/test_overread build/test_abi
+
+      - name: CPU detection picks the right tiers on every emulated part
+        run: |
+          set -eu
+          check() {
+            model="$1"; want_tiers="$2"; want_selected="$3"
+            out=$(~/sde/sde64 -"$model" -- ./build/hpscan --cpu)
+            got_tiers=$(echo "$out" | sed -n 's/^tiers *: //p' | tr ' ' '\n' | sed -n 's/=yes$//p' | tr '\n' ' ' | sed 's/ $//')
+            got_selected=$(echo "$out" | awk '/^selected/ {print $3}')
+            echo "$model: tiers [$got_tiers] selected $got_selected"
+            [ "$got_tiers" = "$want_tiers" ] || { echo "$model: expected tiers [$want_tiers]" >&2; exit 1; }
+            [ "$got_selected" = "$want_selected" ] || { echo "$model: expected $want_selected" >&2; exit 1; }
+          }
+          check mrm "baseline" baseline
+          check nhm "baseline sse42" sse42
+          check hsw "baseline sse42 avx2" avx2
+          check srf "baseline sse42 avx2" avx2
+          check skx "baseline sse42 avx2 avx512" avx2
+          check icx "baseline sse42 avx2 avx512" avx2
+          check spr "baseline sse42 avx2 avx512" avx2
+
+      - name: HOTPATH_BACKEND=avx512 selects the AVX-512 tier
+        run: |
+          set -eu
+          got=$(HOTPATH_BACKEND=avx512 ~/sde/sde64 -skx -- ./build/hpscan --cpu | awk '/^selected/ {print $3}')
+          [ "$got" = "avx512" ] || { echo "asked for avx512, got $got" >&2; exit 1; }
+          echo "HOTPATH_BACKEND=avx512 honoured under -skx"
+
+      - name: Suite per tier on Merom (baseline only)
+        run: make CC=gcc-13 RUNNER="$HOME/sde/sde64 -mrm -ptr-raise --" TIERS="baseline" test-tiers
+
+      - name: Suite per tier on Nehalem (sse42 without AVX)
+        run: make CC=gcc-13 RUNNER="$HOME/sde/sde64 -nhm -ptr-raise --" TIERS="baseline sse42" test-tiers
+
+      - name: Suite per tier on Haswell (avx2)
+        run: make CC=gcc-13 RUNNER="$HOME/sde/sde64 -hsw -ptr-raise --" TIERS="baseline sse42 avx2" test-tiers
+
+      - name: Suite per tier on Skylake server (avx512)
+        run: make CC=gcc-13 RUNNER="$HOME/sde/sde64 -skx -ptr-raise --" TIERS="baseline sse42 avx2 avx512" test-tiers
+
+      - name: AVX-512 tier on Ice Lake and Sapphire Rapids
+        run: |
+          make CC=gcc-13 RUNNER="$HOME/sde/sde64 -icx -ptr-raise --" TIERS="avx512" test-tiers
+          make CC=gcc-13 RUNNER="$HOME/sde/sde64 -spr -ptr-raise --" TIERS="avx512" test-tiers
+
+  # The Microsoft x64 calling convention. The kernels are written once for
+  # System V and src/asm/hp_asm.h adapts them; test_abi checks that rdi, rsi
+  # and xmm6 to xmm15 survive every call, which is where a System V kernel run
+  # on Windows goes wrong. Built with MinGW-w64 gcc (GNU as) and with clang
+  # (integrated assembler), both from MSYS2. The AVX-512 tier is then run under
+  # the Windows build of Intel SDE, so it too is checked against the Windows
+  # convention whatever CPU the runner happens to have.
+  windows:
+    name: windows (${{ matrix.sys }})
+    runs-on: windows-2025
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sys: UCRT64
+            pkg: mingw-w64-ucrt-x86_64-gcc
+            cc: gcc
+          - sys: CLANG64
+            pkg: mingw-w64-clang-x86_64-clang
+            cc: clang
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: msys2/setup-msys2@v2.33.0
+        with:
+          msystem: ${{ matrix.sys }}
+          update: false
+          install: >-
+            make
+            gawk
+            python
+            ${{ matrix.pkg }}
+
+      - name: Report the toolchain and what the runner can do
+        run: |
+          ${{ matrix.cc }} --version | head -1
+          ${{ matrix.cc }} -dumpmachine
+
+      - name: Build
+        run: make CC=${{ matrix.cc }} AR=ar all build/test_vectors.exe build/test_differential.exe build/test_overread.exe build/test_abi.exe
+
+      - name: Which tiers are live on this runner
+        run: ./build/hpscan.exe --cpu
+
+      - name: Full check
+        run: make CC=${{ matrix.cc }} AR=ar check
+
+      - name: Every supported tier on its own
+        run: make CC=${{ matrix.cc }} AR=ar test-tiers
+
+      - name: Cache Intel SDE for Windows
+        id: sde-cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/sde
+          key: sde-windows-${{ env.SDE_VERSION }}
+
+      - name: Fetch Intel SDE for Windows
+        if: steps.sde-cache.outputs.cache-hit != 'true'
+        run: |
+          set -eu
+          dest="$(cygpath -u "$RUNNER_TEMP")/sde"
+          curl -sSfL --retry 3 -o /tmp/sde.tar.xz "$SDE_WINDOWS_URL"
+          echo "$SDE_WINDOWS_SHA256  /tmp/sde.tar.xz" | sha256sum -c -
+          mkdir -p "$dest"
+          tar -xJf /tmp/sde.tar.xz -C "$dest" --strip-components=1
+          ls "$dest"
+
+      - name: AVX-512 tier under the Windows convention, emulated
+        run: |
+          set -eu
+          sde="$(cygpath -u "$RUNNER_TEMP")/sde/sde.exe"
+          "$sde" -spr -- ./build/hpscan.exe --cpu
+          make CC=${{ matrix.cc }} AR=ar RUNNER="$sde -spr -ptr-raise --" TIERS="avx512" test-tiers
+
   # The dispatch layer is the part most likely to break silently, because a
   # mistake there just means a slower but still correct answer. These steps
   # assert that asking for a tier actually selects it.
   dispatch:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      - run: make all
+      - run: make CC=gcc-13 all
 
       - name: HOTPATH_BACKEND selects the requested tier
         run: |
           set -eu
           ./build/hpscan --cpu
-          for b in baseline sse42 avx2; do
+          for b in baseline sse42 avx2 avx512; do
             if ./build/hpscan --cpu | grep -q "$b=yes"; then
               got=$(HOTPATH_BACKEND=$b ./build/hpscan --cpu | awk '/^selected/ {print $3}')
               if [ "$got" != "$b" ]; then
@@ -80,6 +291,13 @@ jobs:
               echo "$b is not available on this runner, skipped"
             fi
           done
+
+      - name: AVX-512 is never chosen without being asked for
+        run: |
+          set -eu
+          got=$(./build/hpscan --cpu | awk '/^selected/ {print $3}')
+          [ "$got" != "avx512" ] || { echo "avx512 was selected automatically" >&2; exit 1; }
+          echo "automatic choice is $got"
 
       - name: An unusable or misspelled request is ignored, not fatal
         run: |
@@ -94,7 +312,7 @@ jobs:
           printf 'alpha\nbeta\ngamma\n' > sample.txt
           head -c 100000 /dev/urandom >> sample.txt
           first=""
-          for b in baseline sse42 avx2; do
+          for b in baseline sse42 avx2 avx512; do
             if ./build/hpscan --cpu | grep -q "$b=yes"; then
               out=$(./build/hpscan --backend=$b sample.txt | grep -E 'bytes|lines|crc32c|fingerprint')
               if [ -z "$first" ]; then
@@ -108,25 +326,37 @@ jobs:
           echo "all available tiers agree"
 
   # The benchmark is not a gate on performance, since a shared CI runner cannot
-  # measure that honestly. It runs so that a change which breaks the harness is
-  # caught here rather than the next time somebody wants numbers.
+  # measure that honestly. It runs so that a change which breaks the harness,
+  # or a baseline library that stops agreeing with the reference, is caught
+  # here rather than the next time somebody wants numbers.
   bench-smoke:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-      - run: make all
+
+      - name: Cache the third party baselines
+        uses: actions/cache@v6
+        with:
+          path: build/third_party
+          key: baselines-${{ runner.os }}-gcc13-${{ hashFiles('bench/fetch-baselines.sh') }}
+
+      - run: make CC=gcc-13 CXX=g++-13 all
       - run: ./build/bench --quick
+      - name: With simdutf and google/crc32c
+        run: make CC=gcc-13 CXX=g++-13 BENCH_ARGS=--quick bench-full
 
   # The generated table file is checked in so that building needs no Python.
   # This proves it still matches what the generator produces, and that the
   # generator's own arithmetic self checks still pass.
   generated:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
-          python-version: '3.x'
+          python-version: '3.12'
       - run: make check-generated
       - name: Regenerating from scratch reproduces the checked in file
         run: |
